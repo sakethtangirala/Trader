@@ -1,0 +1,26 @@
+# models/*.pt intentionally tracked — retrained weights included for portability
+
+# Python cache
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Generated outputs — regenerate with backtests
+graphs/
+logs/
+research_log.txt
+
+# HMM model (auto-created at first runtime cycle)
+models/hmm_spy.pkl
+
+# Claude Code internals
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

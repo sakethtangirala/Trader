@@ -1,0 +1,24 @@
+Using V_scale = 2.5000e+03
+Epoch     1 | Loss: 3.3789e+00 | PDE: 2.6814e-05 | BC_T: 6.7577e-01
+Epoch   100 | Loss: 2.0508e-02 | PDE: 3.0306e-05 | BC_T: 4.0954e-03
+Epoch   200 | Loss: 1.4394e-02 | PDE: 2.3128e-05 | BC_T: 2.8741e-03
+Epoch   300 | Loss: 3.8906e-03 | PDE: 4.3840e-06 | BC_T: 7.7724e-04
+Epoch   400 | Loss: 1.2330e-02 | PDE: 1.3050e-05 | BC_T: 2.4634e-03
+Epoch   500 | Loss: 2.1016e-02 | PDE: 1.6329e-06 | BC_T: 4.2028e-03
+Epoch   600 | Loss: 2.4379e-02 | PDE: 1.2837e-06 | BC_T: 4.8755e-03
+Epoch   700 | Loss: 9.7899e-02 | PDE: 1.3774e-06 | BC_T: 1.9579e-02
+Epoch   800 | Loss: 6.4739e-01 | PDE: 6.0466e-06 | BC_T: 1.2948e-01
+Epoch   900 | Loss: 1.1879e-02 | PDE: 3.7581e-04 | BC_T: 2.3007e-03
+Epoch  1000 | Loss: 1.4166e-02 | PDE: 2.9327e-04 | BC_T: 2.7746e-03
+Epoch  1100 | Loss: 2.7257e-02 | PDE: 2.5819e-04 | BC_T: 5.3997e-03
+Epoch  1200 | Loss: 1.0435e-02 | PDE: 2.3636e-04 | BC_T: 2.0398e-03
+Epoch  1300 | Loss: 2.8206e-03 | PDE: 2.1070e-04 | BC_T: 5.2198e-04
+Epoch  1400 | Loss: 1.1158e-02 | PDE: 1.9261e-04 | BC_T: 2.1930e-03
+Epoch  1500 | Loss: 1.1440e-02 | PDE: 1.7514e-04 | BC_T: 2.2531e-03
+Epoch  1600 | Loss: 1.1076e-02 | PDE: 1.5784e-04 | BC_T: 2.1836e-03
+Epoch  1700 | Loss: 1.2216e-02 | PDE: 1.4577e-04 | BC_T: 2.4140e-03
+Epoch  1800 | Loss: 1.5716e-02 | PDE: 1.3154e-04 | BC_T: 3.1169e-03
+Epoch  1900 | Loss: 4.1604e-03 | PDE: 1.1727e-04 | BC_T: 8.0862e-04
+Epoch  2000 | Loss: 1.1612e-02 | PDE: 1.0772e-04 | BC_T: 2.3009e-03
+V_tilde(t=0.5, x=1.0) = -1.25224942e-02
+V_hat(t=0.5, x=1.0)   = -3.13062354e+01

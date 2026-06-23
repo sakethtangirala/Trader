@@ -1,0 +1,23 @@
+Epoch     1 | Loss: 2.0961e+03 | PDE: 2.0961e+03
+Epoch   100 | Loss: 7.5677e-02 | PDE: 7.5677e-02
+Epoch   200 | Loss: 7.8649e-03 | PDE: 7.8649e-03
+Epoch   300 | Loss: 8.4164e-04 | PDE: 8.4164e-04
+Epoch   400 | Loss: 5.1476e-04 | PDE: 5.1476e-04
+Epoch   500 | Loss: 5.4157e-04 | PDE: 5.4157e-04
+Epoch   600 | Loss: 5.2777e-04 | PDE: 5.2777e-04
+Epoch   700 | Loss: 3.6497e-04 | PDE: 3.6497e-04
+Epoch   800 | Loss: 5.4741e-04 | PDE: 5.4741e-04
+Epoch   900 | Loss: 3.4386e-04 | PDE: 3.4386e-04
+Epoch  1000 | Loss: 4.8346e-04 | PDE: 4.8346e-04
+Epoch  1100 | Loss: 4.0721e-04 | PDE: 4.0721e-04
+Epoch  1200 | Loss: 4.6782e-04 | PDE: 4.6782e-04
+Epoch  1300 | Loss: 4.2678e-04 | PDE: 4.2678e-04
+Epoch  1400 | Loss: 1.2298e-03 | PDE: 1.2298e-03
+Epoch  1500 | Loss: 4.2917e-04 | PDE: 4.2917e-04
+Epoch  1600 | Loss: 7.7328e-04 | PDE: 7.7328e-04
+Epoch  1700 | Loss: 1.1230e-03 | PDE: 1.1230e-03
+Epoch  1800 | Loss: 6.8557e-04 | PDE: 6.8557e-04
+Epoch  1900 | Loss: 3.3610e-04 | PDE: 3.3610e-04
+Epoch  2000 | Loss: 2.7886e-04 | PDE: 2.7886e-04
+
+Final V(0.5,1.0) = -0.23528395353809536
