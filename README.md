@@ -35,7 +35,8 @@ Trader/
 ├── engine.py             # Data fetch, HMM, GK volatility, PINN allocation, momentum, signals
 ├── risk_manager.py       # Circuit breakers, vol targeting, position sizing, market impact
 ├── brokerage.py          # Alpaca TradingClient wrapper
-├── universe.py           # Daily universe builder (finviz screener + Alpaca fallback)
+├── universe.py           # Daily universe builder (stock_info.csv primary; screener + Alpaca fallback)
+├── stock_info.csv        # ~1,900 Alpaca-validated tickers (pre-validated, no API call needed)
 ├── sentiment.py          # FinBERT + RSS + keyword filter + decay + peak cache
 ├── settings.py           # All constants (single source of truth)
 ├── train_pinns.py        # PINN training script (run once)
@@ -172,7 +173,7 @@ Queries the best loaded PINN for market-level equity fraction `π*(t, w, y)`:
 | 3 | GBM | (t, w) | Baseline |
 | 4 | Merton ratio | analytical | (μ−r)/(γσ²) — PINN allocation fallback only; not used for per-stock sizing |
 
-Note: the Merton ratio is the fallback for *total equity allocation* (`get_pinn_allocation()` returns `None` when no `.pt` files are loaded, and `compute_signals()` substitutes Merton). Per-stock *sizing* uses inverse-volatility weights (`1/σ_i / Σ 1/σ_j`) passed as `stock_weights` to `risk_manager.position_size()` — these are independent.
+Note: per-stock *sizing* uses inverse-volatility weights (`1/σ_i / Σ 1/σ_j`) — Merton is not used for sizing. Merton appears only as a VIX-attenuated floor on the total PINN allocation to guard against calibration gaps: `floor_scale = clip(1 − 0.03×(VIX−15), 0.25, 1.0)`. At VIX=15 the floor is full Merton; at VIX=40+ it decays to 25% of Merton, preventing the constant-σ Merton estimate from overriding the Heston PINN's stochastic-vol signal in high-fear regimes.
 
 `t = min(days_to_year_end / 252, 0.5)` — CRRA paper horizon T = 0.5 years.  
 `w = equity / INITIAL_EQUITY` — normalized wealth sourced from `settings.py`.
@@ -183,7 +184,7 @@ Note: the Merton ratio is the fallback for *total equity allocation* (`get_pinn_
 
 **Dynamic risk-free rate** (`engine.py: fetch_risk_free_rate()`): fetches the 3-month T-bill yield (`^IRX`) from yfinance once per calendar day and caches the result. Used in `compute_merton_ratio()` as the risk-free rate `r`, replacing the static 5%. This corrects the Merton fallback for high-rate regimes (e.g. r=5.3% in 2023 meaningfully shrinks the equity risk premium μ−r and should reduce allocation). PINN models have r=5% baked into training; dynamic r only affects the Merton fallback path.
 
-Result cached daily in `_PINNCache` keyed by `(date, confirmed_regime)`. Intraday signals operate within this ceiling.
+Result cached in `_PINNCache` keyed by `(date, confirmed_regime, vix_bucket)`. VIX is bucketed to the nearest 2 points so an intraday spike (e.g. 18 → 28) invalidates the cache and triggers a fresh PINN query instead of serving the morning's calm-market allocation all day.
 
 ### Layer 3 — Intraday Microstructure
 
@@ -327,13 +328,16 @@ Loss weights (`PINN_ALPHA` in `settings.py`): HJB=1.0, stat=1.0, comp=0.1, stab=
 
 ## Universe Building
 
-Rebuilt once per trading day at market open:
+Rebuilt once per trading day at market open. `stock_info.csv` is the canonical source — ~1,900 tickers pre-validated against the Alpaca API (tradable, fractionable, active) with price, volume, and 1-month momentum columns.
 
-1. OpenBB finviz screener — `most_active`, `top_gainers`, `oversold`, `unusual_volume`
-2. Alpaca assets API — all fractionable US equities; filter price > $5, avg volume > 1M, sort by 30-day momentum
-3. Hardcoded 10-ticker fallback if both fail
+**Source priority:**
 
-Target size: 150 symbols.
+1. **`stock_info.csv` (primary)** — read directly using the pre-validated columns (`AlpacaStatus`, `AlpacaTradable`, `AlpacaFractionable`). No live Alpaca API call. Returns all eligible rows (up to `CSV_UNIVERSE_MAX_SYMBOLS`; 0 = unlimited).
+2. **OpenBB finviz screener (fallback)** — `most_active`, `top_gainers`, `oversold`, `unusual_volume`. Only reached if the CSV is missing or empty.
+3. **Alpaca assets API (fallback)** — all fractionable US equities; filter price > $5, avg volume > 1M, sort by 30-day momentum. Only reached if the screener returns fewer than 20 symbols.
+4. **Hardcoded 10-ticker watchlist** — last resort if all sources fail.
+
+**Updating the CSV:** Re-run `audit_alpaca_listings.py` to regenerate `stock_info.csv` against the current Alpaca asset list. The CSV format must preserve the `AlpacaSymbol`, `AlpacaStatus`, `AlpacaTradable`, and `AlpacaFractionable` columns for the fast path to apply.
 
 ---
 
@@ -366,7 +370,7 @@ Target size: 150 symbols.
 | `TRADING_HORIZON_YEARS` | 0.5 | T in HJB equation |
 | `INITIAL_EQUITY` | 100_000.0 | `w = equity / INITIAL_EQUITY` — update if paper account is reset |
 | `MARKET_CRASH_SPY_THRESHOLD` | −0.03 | Hard SPY 1-day return backstop (fires before HMM) |
-| `PINN_DAILY_CACHE` | `True` | Cache PINN allocation by `(date, confirmed_regime)` |
+| `PINN_DAILY_CACHE` | `True` | Cache PINN allocation by `(date, regime, vix_bucket)` — 2-pt VIX buckets so intraday spikes re-query |
 | `MIN_POSITION_WEIGHT` | 0.015 | Suppress positions < 1.5% of equity (hysteresis) |
 | `LIMIT_ORDER_ENABLED` | `True` | Submit limit orders instead of market orders |
 | `LIMIT_ORDER_OFFSET_BPS` | 2 | Peg limit 2 bps below current price for passive fill |
@@ -416,6 +420,8 @@ Target size: 150 symbols.
 | 10 | Inverse-vol weighting replaces Merton sizing | **ACCEPT** | **0.53** | **+10.1%** |
 
 **Best config (Iter 10):** Test Sharpe 0.53, MaxDD −7.9%, Calmar 1.27. All settings reflected in `settings.py`.
+
+**`research.py` restructured (2026-06-23):** Iters 1–3 are baked into `StrategyConfig` defaults. The loop now runs Iters 0–7 starting from the Iter 3 config (trailing stop + 10% cash reserve) as the baseline. Re-running `research.py` begins from this validated foundation and only tests ideas beyond it.
 
 ---
 

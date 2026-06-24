@@ -4,7 +4,7 @@ Market data (OpenBB) + HMM regime detection + PINN-based optimal allocation.
 Architecture: PINN as risk multiplier on a momentum-first stock selection layer.
   · Stock selection  — 12-1 month momentum ranks buy candidates (cross-sectional)
   · Risk scaling     — PINN π*(t,w,y) scales total equity exposure (0→1 multiplier)
-  · Position sizing  — Merton ratio distributes PINN exposure across ranked candidates
+  · Position sizing  — inverse-vol weights (1/σ_i / Σ1/σ_j) distribute PINN exposure across ranked candidates
   · Exits            — trailing stop (-10% from peak) + EMA trend reversal
 
 Allocation hierarchy (most → least sophisticated):
@@ -562,13 +562,19 @@ def compute_signals(df: pd.DataFrame, regime: str,
     if pinn_alloc is not None and regime == "bull" and CRRA_GAMMA_BULL < CRRA_GAMMA:
         pinn_alloc = float(np.clip(pinn_alloc * (CRRA_GAMMA / CRRA_GAMMA_BULL), 0.0, 1.0))
         logger.debug(f"γ-scale bull: π*={pinn_alloc:.4f} (γ_eff={CRRA_GAMMA_BULL})")
-    # Floor: max(PINN, per-stock Merton). Mirrors research.py Iter 10 exactly:
-    #   eff = max(alloc, m) if self.pinns else m
-    # Prevents PINN calibration gaps (output ≈ 0 on some inputs) from silencing
-    # buys on stocks with strong fundamentals. The per-stock Merton ratio is a
-    # reliable lower bound since it's computed from this stock's own μ and σ.
+    # Merton floor — attenuated by VIX level.
+    # In low-vol environments (VIX ≈ 15) the main risk is PINN calibration gaps
+    # (output ≈ 0 on unfamiliar inputs) so a full Merton floor prevents missing
+    # good trades.  In high-VIX regimes the Heston PINN's stochastic-vol
+    # awareness is authoritative: Merton assumes constant σ and drift, so
+    # applying a full Merton floor at VIX=40 would systematically override the
+    # very signal the PINN was trained to produce in those conditions.
+    # Linear decay: floor_scale = 1.0 at VIX=15 → 0.25 at VIX=40+.
     if pinn_alloc is not None:
-        pinn_alloc = max(float(pinn_alloc), merton)
+        vix_level    = (vix_var ** 0.5) * 100.0
+        floor_scale  = float(np.clip(1.0 - 0.03 * (vix_level - 15.0), 0.25, 1.0))
+        merton_floor = merton * floor_scale
+        pinn_alloc   = max(float(pinn_alloc), merton_floor)
     else:
         pinn_alloc = merton
 

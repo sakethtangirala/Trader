@@ -9,7 +9,6 @@ Order execution strategy:
   - sell() and close_all() always use market orders (urgency takes priority over spread).
 """
 from __future__ import annotations
-from datetime import datetime, timezone
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (

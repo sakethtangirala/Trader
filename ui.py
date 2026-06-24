@@ -7,6 +7,7 @@ buy candidates, open positions, and a countdown to the next cycle.
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from rich import box
@@ -77,9 +78,9 @@ class TradingUI:
         self.exits_this_cycle: list[tuple[str, str]] = []  # (sym, reason)
 
         # ── Countdown state ──────────────────────────────────────────────
-        self._cycle_total:   int = 900
-        self._cycle_elapsed: int = 0
-        self._cycle_label:   str = "15-min (bear)"
+        self._cycle_total:  int   = 900
+        self._cycle_start:  float = time.monotonic()  # wall-clock reference
+        self._cycle_label:  str   = "15-min (bear)"
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -152,14 +153,13 @@ class TradingUI:
         self._refresh()
 
     def start_countdown(self, total_seconds: int, label: str) -> None:
-        self._cycle_total   = max(total_seconds, 1)
-        self._cycle_elapsed = 0
-        self._cycle_label   = label
-        self._scan_active   = False
+        self._cycle_total  = max(total_seconds, 1)
+        self._cycle_start  = time.monotonic()
+        self._cycle_label  = label
+        self._scan_active  = False
         self._refresh()
 
-    def tick_countdown(self, elapsed: int) -> None:
-        self._cycle_elapsed = elapsed
+    def tick_countdown(self, elapsed: int) -> None:  # noqa: ARG002
         self._refresh()
 
     # ── Render ────────────────────────────────────────────────────────────
@@ -337,12 +337,14 @@ class TradingUI:
     # ── Countdown ─────────────────────────────────────────────────────────
 
     def _render_countdown(self) -> Panel:
-        remaining = max(self._cycle_total - self._cycle_elapsed, 0)
-        pct       = self._cycle_elapsed / max(self._cycle_total, 1)
+        elapsed   = time.monotonic() - self._cycle_start
+        remaining = max(self._cycle_total - elapsed, 0.0)
+        pct       = min(elapsed / max(self._cycle_total, 1), 1.0)
         width     = max(self.console.width - 10, 20)
         filled    = int(pct * width)
 
-        mins, secs = divmod(remaining, 60)
+        rem_s      = int(remaining)
+        mins, secs = divmod(rem_s, 60)
         time_str   = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
 
         bar = (f"[cyan]{'█' * filled}[/]"

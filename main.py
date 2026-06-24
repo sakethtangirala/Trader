@@ -2,20 +2,27 @@
 Autonomous Trading Agent — main orchestration loop.
 
 Cycle (every 15 min during market hours):
-  1. Rebuild universe daily (OpenBB screener + Alpaca assets)
+  1. Rebuild universe daily (stock_info.csv primary; screener + Alpaca fallback)
   2. Check circuit breakers
   3. Detect SPY market regime via HMM
   4. Crash → close all and halt
   5. Stop-loss / take-profit on open positions
   6. Query Heston/Regime/GBM PINN for market-level allocation
-  7. Scan universe for RSI+EMA buy signals
-  8. Size via Merton-weighted PINN allocation, execute
+  7. Scan active batch for buy signals (cache hits instant; inline for misses)
+     + sweep pre-computed bonus candidates from inter-cycle background window
+  8. Size via PINN allocation + inverse-vol weights, execute
   9. Log everything to logs/trade_journal.log
+
+Inter-cycle window (bear: ~10 min, bull: ~113 min):
+  After the first 5-min exit check, a daemon thread walks the universe from
+  _precompute_idx, computes signals + p-values, and caches them.  Next cycle
+  reads cache hits in microseconds instead of fetching yfinance.
 
 Run train_pinns.py once before starting for optimal PINN allocation.
 Falls back to Merton ratio + RSI/EMA rules if no PINN is available.
 """
 import os
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -192,26 +199,165 @@ _ui: TradingUI | None = None
 # Daily PINN allocation cache
 # ---------------------------------------------------------------------------
 class _PINNCache:
-    """Thin wrapper that stores today's PINN allocation and the regime it was computed for."""
-    def __init__(self):
-        self._date:     object  = None
-        self._regime:   str     = ""
-        self._alloc:    float   = -1.0
+    """
+    Caches the PINN market-level allocation by (date, regime, vix_bucket).
 
-    def get(self, today, regime: str) -> float | None:
+    VIX is included in the key because the Heston PINN is explicitly
+    variance-aware: π*(t, w, y) is a function of y = (VIX/100)².
+    Without the VIX bucket an intraday VIX spike (e.g. 18 → 28) would
+    leave the agent acting on the morning's calm-market allocation all day.
+    Bucket width = 2 VIX points — small enough to capture meaningful
+    volatility regime shifts, large enough to avoid spurious re-queries
+    on tick-level noise.
+    """
+
+    def __init__(self):
+        self._date:       object  = None
+        self._regime:     str     = ""
+        self._vix_bucket: int     = -1
+        self._alloc:      float   = -1.0
+
+    @staticmethod
+    def _bucket(vix_var: float) -> int:
+        vix_level = (vix_var ** 0.5) * 100.0
+        return round(vix_level / 2) * 2
+
+    def get(self, today, regime: str, vix_var: float) -> float | None:
         if not PINN_DAILY_CACHE:
-            return None   # caching disabled → always recompute
-        if self._date == today and self._regime == regime and self._alloc >= 0:
+            return None
+        if (self._date == today and self._regime == regime
+                and self._vix_bucket == self._bucket(vix_var)
+                and self._alloc >= 0):
             return self._alloc
         return None
 
-    def set(self, today, regime: str, alloc: float) -> None:
-        self._date   = today
-        self._regime = regime
-        self._alloc  = alloc
+    def set(self, today, regime: str, vix_var: float, alloc: float) -> None:
+        self._date       = today
+        self._regime     = regime
+        self._vix_bucket = self._bucket(vix_var)
+        self._alloc      = alloc
 
 
 _pinn_cache = _PINNCache()
+
+
+# ---------------------------------------------------------------------------
+# Inter-cycle signal pre-computation
+# ---------------------------------------------------------------------------
+
+class _SignalCache:
+    """
+    Thread-safe store for signals computed in the inter-cycle background window.
+    Keyed by (symbol, regime, date).  Entries expire after max_age_s seconds so
+    run_cycle() never acts on stale data.
+    """
+
+    def __init__(self) -> None:
+        self._lock  = threading.Lock()
+        self._store: dict[tuple, tuple] = {}  # key → (sig_dict, mono_ts)
+
+    def set(self, symbol: str, regime: str, date: object, sig: dict) -> None:
+        with self._lock:
+            self._store[(symbol, regime, date)] = (sig, time.monotonic())
+
+    def get(self, symbol: str, regime: str, date: object,
+            max_age_s: float = 720.0) -> dict | None:
+        with self._lock:
+            entry = self._store.get((symbol, regime, date))
+        if entry is None:
+            return None
+        sig, ts = entry
+        return sig if time.monotonic() - ts <= max_age_s else None
+
+    def get_all_for_date(self, regime: str, date: object,
+                         max_age_s: float = 720.0) -> dict[str, dict]:
+        """Return every fresh cached signal for this regime+date. symbol → sig_dict."""
+        now = time.monotonic()
+        with self._lock:
+            return {
+                k[0]: v[0]
+                for k, v in self._store.items()
+                if k[1] == regime and k[2] == date and (now - v[1]) <= max_age_s
+            }
+
+    def clear_old_dates(self, current_date: object) -> None:
+        with self._lock:
+            stale = [k for k in self._store if k[2] != current_date]
+            for k in stale:
+                del self._store[k]
+
+
+_signal_cache    = _SignalCache()
+_precompute_idx:  int         = 0     # where in the universe the next window starts
+_precompute_ctx:  dict | None = None  # context snapshot written by run_cycle()
+_precompute_stop  = threading.Event() # set by run_cycle() to abort a running thread
+
+
+def _run_precompute(
+    universe:   list[str],
+    start_idx:  int,
+    deadline:   float,          # time.monotonic() value — stop when reached
+    regime:     str,
+    pinns:      dict,
+    equity:     float,
+    initial:    float,
+    vix_var:    float,
+    sentiment,
+    spy_1min,
+    stop_event: threading.Event,
+) -> None:
+    """
+    Background signal pre-computer.
+
+    Walks the universe from start_idx (wrapping), evaluating each symbol and
+    storing the result in _signal_cache.  Also pre-warms the p-value cache so
+    run_cycle() never needs to compute it inline for a cache-hit symbol.
+    Stops when deadline is reached or stop_event is set, then records the next
+    index so the following inter-cycle window continues from where this one left off.
+    """
+    global _precompute_idx, _pvalue_cache, _pvalue_cache_date
+
+    today   = datetime.now().date()
+    n       = len(universe)
+    if n == 0:
+        return
+    idx     = start_idx % n
+    scanned = 0
+
+    while not stop_event.is_set() and time.monotonic() < deadline:
+        symbol = universe[idx]
+        idx    = (idx + 1) % n
+
+        if _signal_cache.get(symbol, regime, today) is not None:
+            continue  # already evaluated this session
+
+        try:
+            df = fetch_ohlcv(symbol, lookback_days=SIGNAL_LOOKBACK_DAYS)
+            if df.empty:
+                continue
+            df_1min = fetch_1min(symbol, bars=30)
+            sig = compute_signals(
+                df, regime, pinns, equity, initial, vix_var,
+                ticker=symbol, sentiment_engine=sentiment,
+                df_1min=df_1min, spy_1min=spy_1min,
+            )
+            _signal_cache.set(symbol, regime, today, sig)
+
+            # Pre-warm p-value while the close series is in memory
+            if WALK_FORWARD_GATE:
+                today_d = datetime.now().date()
+                if _pvalue_cache_date != today_d:
+                    _pvalue_cache      = {}
+                    _pvalue_cache_date = today_d
+                if symbol not in _pvalue_cache:
+                    _pvalue_cache[symbol] = quick_pvalue(df["close"], n=PERMUTATION_N)
+
+            scanned += 1
+        except Exception as exc:
+            logger.debug(f"[precompute] {symbol}: {exc}")
+
+    _precompute_idx = idx
+    logger.info(f"[precompute] Scanned {scanned} symbols; next window starts at idx={idx}")
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +369,8 @@ def run_cycle(broker: Broker, risk: RiskManager,
               sentiment: FreeSentimentEngine | None,
               sentiment_worker: "SentimentWorker | None" = None) -> int:
     """Returns the number of seconds to sleep before the next cycle."""
-    global _cycle_counter
+    global _cycle_counter, _precompute_ctx
+    _precompute_stop.set()   # abort any inter-cycle pre-computation still running
     _cycle_counter += 1
 
     # Batch rotation: evaluate UNIVERSE_BATCH_SIZE stocks per cycle.
@@ -321,16 +468,27 @@ def run_cycle(broker: Broker, risk: RiskManager,
     # Daily PINN allocation cache — re-query only when date or regime changes.
     today           = datetime.now().date()
     w_norm          = equity / initial
-    cached_alloc    = _pinn_cache.get(today, regime)
+    cached_alloc    = _pinn_cache.get(today, regime, vix_var)
 
     spy_sig = compute_signals(spy_df, regime, pinns, equity, initial, vix_var,
                                ticker="SPY", sentiment_engine=sentiment,
                                df_1min=spy_1min)
 
+    # Snapshot context for the inter-cycle background signal pre-computer.
+    # Written here so all required state (regime, vix, spy_1min) is confirmed.
+    _precompute_ctx = dict(
+        regime=regime, pinns=pinns, equity=equity, initial=initial,
+        vix_var=vix_var, sentiment=sentiment, spy_1min=spy_1min,
+    )
+
     if cached_alloc is None:
         market_alloc = spy_sig["pinn_allocation"]
-        _pinn_cache.set(today, regime, market_alloc)
-        logger.info(f"PINN π*={market_alloc:.4f} regime={regime} w={w_norm:.3f} — cached EOD")
+        _pinn_cache.set(today, regime, vix_var, market_alloc)
+        vix_bucket = _PINNCache._bucket(vix_var)
+        logger.info(
+            f"PINN π*={market_alloc:.4f} regime={regime} w={w_norm:.3f} "
+            f"VIX≈{(vix_var**0.5)*100:.1f} bucket={vix_bucket} — cached"
+        )
     else:
         market_alloc = cached_alloc
 
@@ -392,27 +550,37 @@ def run_cycle(broker: Broker, risk: RiskManager,
         return _next_cycle_interval(regime, vix_var)
 
     buy_candidates: list[dict] = []
+    active_set = set(active_batch)
+
     if _ui:
         _ui.start_scan(len([s for s in active_batch if s not in positions]))
+
+    # --- Phase 1: active batch — cache hit (instant) or fresh inline compute ---
     for symbol in active_batch:
         if symbol in positions:
             continue
-        df = fetch_ohlcv(symbol, lookback_days=SIGNAL_LOOKBACK_DAYS)
-        if df.empty:
-            if _ui:
-                _ui.tick_scan(symbol, "hold")
-            continue
-        df_1min = fetch_1min(symbol, bars=30)
-        sig = compute_signals(df, regime, pinns, equity, initial, vix_var,
-                              ticker=symbol, sentiment_engine=sentiment,
-                              df_1min=df_1min, spy_1min=spy_1min)
+        cached_sig = _signal_cache.get(symbol, regime, today)
+        if cached_sig is not None:
+            sig      = cached_sig
+            df_close = None   # close series not available for cache hits
+        else:
+            df = fetch_ohlcv(symbol, lookback_days=SIGNAL_LOOKBACK_DAYS)
+            if df.empty:
+                if _ui:
+                    _ui.tick_scan(symbol, "hold")
+                continue
+            df_1min  = fetch_1min(symbol, bars=30)
+            sig      = compute_signals(df, regime, pinns, equity, initial, vix_var,
+                                       ticker=symbol, sentiment_engine=sentiment,
+                                       df_1min=df_1min, spy_1min=spy_1min)
+            df_close = df["close"]
+
         if _ui:
             _ui.tick_scan(symbol, sig["signal"])
         logger.debug(f"{symbol} {sig['signal']} π*={sig['pinn_allocation']:.3f} "
                      f"mom={sig['mom_score']:+.3f} rsi={sig['rsi']:.0f}")
+
         if sig["signal"] == "buy":
-            # Walk-forward p-value gate: skip symbols whose EMA signal is
-            # statistically indistinguishable from shuffled noise today.
             if WALK_FORWARD_GATE:
                 global _pvalue_cache, _pvalue_cache_date
                 today_d = datetime.now().date()
@@ -420,8 +588,12 @@ def run_cycle(broker: Broker, risk: RiskManager,
                     _pvalue_cache      = {}
                     _pvalue_cache_date = today_d
                 if symbol not in _pvalue_cache:
-                    _pvalue_cache[symbol] = quick_pvalue(
-                        df["close"], n=PERMUTATION_N)
+                    if df_close is not None:
+                        _pvalue_cache[symbol] = quick_pvalue(df_close, n=PERMUTATION_N)
+                    else:
+                        # Cache hit but precompute didn't set p-value yet — skip
+                        # conservatively; it will be available next cycle.
+                        continue
                 pval = _pvalue_cache[symbol]
                 if pval >= PERMUTATION_PVALUE_GATE:
                     logger.debug(
@@ -440,6 +612,35 @@ def run_cycle(broker: Broker, risk: RiskManager,
                 "daily_volume": sig["daily_volume"],
                 "gk_vol":       sig["gk_vol"] if sig["gk_vol"] > 0 else sig["sigma_est"],
             })
+
+    # --- Phase 2: bonus buy candidates pre-computed in the inter-cycle window ---
+    # These are symbols outside active_batch that the background thread already
+    # evaluated.  p-values are populated by the same thread, so no extra fetches.
+    pre_computed = _signal_cache.get_all_for_date(regime, today)
+    bonus_added  = 0
+    for symbol, sig in pre_computed.items():
+        if symbol in active_set or symbol in positions:
+            continue
+        if sig["signal"] != "buy":
+            continue
+        if WALK_FORWARD_GATE:
+            pval = _pvalue_cache.get(symbol, 1.0)
+            if pval >= PERMUTATION_PVALUE_GATE:
+                continue
+        buy_candidates.append({
+            "symbol":       symbol,
+            "price":        sig["close"],
+            "momentum":     sig["mom_score"],
+            "merton":       sig["merton_ratio"],
+            "sigma":        max(sig["sigma_est"], 0.01),
+            "pinn":         sig["pinn_allocation"],
+            "daily_volume": sig["daily_volume"],
+            "gk_vol":       sig["gk_vol"] if sig["gk_vol"] > 0 else sig["sigma_est"],
+        })
+        bonus_added += 1
+
+    if bonus_added:
+        logger.info(f"[precompute] {bonus_added} bonus buy candidates from inter-cycle window")
 
     # Rank by 12-1 month momentum
     buy_candidates.sort(key=lambda x: x["momentum"], reverse=True)
@@ -545,6 +746,7 @@ def main() -> None:
         if is_new_day(last_day):
             risk.reset_daily_start()
             last_day = datetime.now().day
+            _signal_cache.clear_old_dates(datetime.now().date())
             try:
                 universe = build_universe()
             except Exception as e:
@@ -568,7 +770,8 @@ def main() -> None:
             if _ui:
                 _ui.start_countdown(sleep_secs, interval_label)
 
-            elapsed = 0
+            elapsed          = 0
+            precompute_armed = False   # launch precompute only after first exit check
             while elapsed < sleep_secs and is_market_open():
                 chunk = min(STOP_CHECK_INTERVAL_SECONDS, sleep_secs - elapsed)
                 time.sleep(chunk)
@@ -588,6 +791,33 @@ def main() -> None:
                                 risk.clear_peak(sym)
                     except Exception as exc:
                         logger.warning(f"Exit-check error: {exc}")
+
+                    # After the first exit check, launch background signal
+                    # pre-computation for the rest of the inter-cycle window.
+                    # Leaves 60 s of buffer before the next cycle fires.
+                    if not precompute_armed and _precompute_ctx is not None:
+                        precompute_armed = True
+                        window = sleep_secs - elapsed - 60
+                        if window > 0:
+                            deadline = time.monotonic() + window
+                            _precompute_stop.clear()
+                            ctx = _precompute_ctx
+                            threading.Thread(
+                                target=_run_precompute,
+                                args=(
+                                    universe, _precompute_idx, deadline,
+                                    ctx["regime"], ctx["pinns"], ctx["equity"],
+                                    ctx["initial"], ctx["vix_var"],
+                                    ctx["sentiment"], ctx["spy_1min"],
+                                    _precompute_stop,
+                                ),
+                                daemon=True,
+                                name="signal-precompute",
+                            ).start()
+                            logger.info(
+                                f"[precompute] Started from idx={_precompute_idx} "
+                                f"(window={window:.0f}s)"
+                            )
         else:
             logger.debug("Market closed — sleeping 5 min")
             time.sleep(300)

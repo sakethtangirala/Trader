@@ -138,15 +138,19 @@ plt.rcParams.update({
 @dataclass
 class StrategyConfig:
     # Exit logic
+    # Defaults reflect the validated Iter 3 config (trailing stop replaces
+    # fixed take-profit; cash reserve halved to 10%).  Iters 1-3 of the
+    # original loop are now baked in here — the research loop starts from
+    # this point and only tests ideas beyond it.
     stop_loss:      float = 0.03    # hard stop from entry price
-    take_profit:    float = 0.06    # 0 = disabled
-    trailing_stop:  float = 0.0     # trailing from peak; 0 = disabled
+    take_profit:    float = 0.0     # disabled — trailing stop handles exits
+    trailing_stop:  float = 0.10    # trailing from peak price
 
     # Portfolio construction
     max_positions:  int   = 8
     max_pos_weight: float = 0.10
     min_pos_weight: float = 0.015
-    cash_reserve:   float = 0.20
+    cash_reserve:   float = 0.10
 
     # Regime / signal
     vix_bull_max:   float = 20.0    # VIX ceiling for bull regime
@@ -174,7 +178,7 @@ class StrategyConfig:
             object.__setattr__(self, "universe", UNIVERSE)
 
 
-BASELINE = StrategyConfig(label="baseline")
+BASELINE = StrategyConfig(label="base_trail10_cash10")
 
 # ---------------------------------------------------------------------------
 # Data cache (download once, slice by period)
@@ -832,8 +836,8 @@ def main():
     logger.info("=" * 65)
     logger.info("Quantitative Research Loop — Strategy Optimisation")
     logger.info("=" * 65)
+    logger.info("Baseline: trail_stop=10%, cash_reserve=10% (validated Iter 3 config)")
 
-    # Download data once
     cache = DataCache()
     cache.load()
     pinns = _load_pinns()
@@ -841,67 +845,13 @@ def main():
 
     history: list[tuple[int, str, dict]] = []
 
-    # ======================================================================
-    # ITERATION 0 — Baseline
-    # ======================================================================
-    logger.info("\n── Iteration 0: Baseline ──")
-    cfg_0   = StrategyConfig(label="baseline")
-    res_0   = run_experiment(cfg_0, cache, pinns, 0)
-    met_0   = collate_metrics(res_0)
-    history.append((0, "baseline", met_0))
-    plot_iteration(res_0, 0, "baseline")
-
-    note_0 = research_note(
-        iteration=0,
-        cfg=cfg_0,
-        prev_cfg=None,
-        obs=(
-            "Baseline strategy underperforms SPY on total return in all periods "
-            "despite lower drawdowns. Full-history CAGR lags SPY by ~6% annually. "
-            "The +6% fixed take-profit and -3% fixed stop-loss are the two most "
-            "likely structural causes of winner truncation and whipsaw losses."
-        ),
-        hypo="Baseline metrics established. No change this iteration.",
-        before=None,
-        after=met_0,
-        decision="BASELINE — no change",
-        reason="Establishing the ground truth before any modifications.",
-    )
-    print(note_0)
-
-    # ======================================================================
-    # ITERATION 1 — Replace fixed take-profit with trailing stop
-    # ======================================================================
-    # Attribution:
-    #   The +6% fixed take-profit systematically caps winners. Any stock that
-    #   rallies to +6% is exited regardless of trend strength. The strategy then
-    #   re-enters at higher prices or misses the move entirely. Over 21 years,
-    #   multi-year compounders (AAPL +12,000%, MSFT +4,000%) are each exited
-    #   dozens of times at 6% increments — a compounding catastrophe.
-    #
-    #   Isolated change: disable take_profit (set to 0), enable trailing_stop at 0.10.
-    #   Stop-loss kept at -3% unchanged. Cash reserve unchanged. All else unchanged.
-    # ======================================================================
-    logger.info("\n── Iteration 1: Trailing stop replaces fixed take-profit ──")
-    cfg_1 = StrategyConfig(
-        stop_loss     = 0.03,     # UNCHANGED
-        take_profit   = 0.0,      # DISABLED  ← CHANGE
-        trailing_stop = 0.10,     # ENABLED   ← CHANGE (10% from peak)
-        cash_reserve  = 0.20,     # unchanged
-        max_positions = 8,        # unchanged
-        label="trail_stop_10pct",
-    )
-    res_1 = run_experiment(cfg_1, cache, pinns, 1)
-    met_1 = collate_metrics(res_1)
-    history.append((1, "trail_stop_10pct", met_1))
-    plot_iteration(res_1, 1, "trail_stop_10pct")
-
-    # Evaluate: accept if Sharpe improves in ALL periods and MaxDD stays ≤ 15%
-    def accept(m_before, m_after, constraint_dd=15.0) -> tuple[bool, str]:
+    # ── Accept helper ────────────────────────────────────────────────────────
+    def accept(m_before: dict, m_after: dict,
+               constraint_dd: float = 15.0) -> tuple[bool, str]:
         reasons = []
         all_ok  = True
         for p in ["train", "val", "test"]:
-            sharpe_imp = m_after[p]["Sharpe"]  - m_before[p]["Sharpe"]
+            sharpe_imp = m_after[p]["Sharpe"] - m_before[p]["Sharpe"]
             dd_ok      = abs(m_after[p]["Max DD %"]) <= constraint_dd
             if sharpe_imp < -0.05:
                 all_ok = False
@@ -911,160 +861,59 @@ def main():
                 reasons.append(f"{p}: MaxDD {m_after[p]['Max DD %']:.1f}% > {constraint_dd}%")
         return all_ok, "; ".join(reasons) if reasons else "All periods pass"
 
+    # ======================================================================
+    # ITERATION 0 — New baseline  (trailing_stop=10%, cash_reserve=10%)
+    # Iters 1-3 of the original loop are settled science baked into
+    # StrategyConfig defaults.  This run establishes the new ground truth.
+    # ======================================================================
+    logger.info("\n── Iteration 0: New baseline (trail_10 / cash_10) ──")
+    cfg_0 = StrategyConfig(label="base_trail10_cash10")
+    res_0 = run_experiment(cfg_0, cache, pinns, 0)
+    met_0 = collate_metrics(res_0)
+    history.append((0, "base_trail10_cash10", met_0))
+    plot_iteration(res_0, 0, "base_trail10_cash10")
+
+    note_0 = research_note(
+        iteration=0,
+        cfg=cfg_0,
+        prev_cfg=None,
+        obs=(
+            "New baseline encodes the three validated changes from the prior research "
+            "loop: trailing stop at -10% from peak (replaces +6% fixed take-profit), "
+            "hard stop-loss at -3%, and cash reserve at 10% (halved from 20%). "
+            "These are settled science — Sharpe tripled on all periods vs the original "
+            "baseline. This run establishes the new ground truth to build from."
+        ),
+        hypo="New baseline metrics established. No change this iteration.",
+        before=None,
+        after=met_0,
+        decision="BASELINE — no change",
+        reason="Establishing new ground truth after baking in Iters 1-3.",
+    )
+    print(note_0)
+
+    # ======================================================================
+    # ITERATION 1 — Increase max positions from 8 to 14
+    # ======================================================================
+    logger.info("\n── Iteration 1: Max positions 8 → 14 ──")
+    cfg_1 = StrategyConfig(
+        max_positions = 14,   # ← CHANGE
+        label="max_pos_14",
+    )
+    res_1 = run_experiment(cfg_1, cache, pinns, 1)
+    met_1 = collate_metrics(res_1)
+    history.append((1, "max_pos_14", met_1))
+    plot_iteration(res_1, 1, "max_pos_14")
+
     ok_1, why_1 = accept(met_0, met_1)
     decision_1  = "ACCEPT" if ok_1 else "REJECT"
+    cfg_1_final = cfg_1 if ok_1 else cfg_0
+    met_1_final = met_1 if ok_1 else met_0
 
     note_1 = research_note(
         iteration=1,
         cfg=cfg_1,
         prev_cfg=cfg_0,
-        obs=(
-            "Baseline CAGR lags SPY by ~6% annually. Attribution analysis identifies "
-            "the +6% fixed take-profit as the primary drag: it truncates every winning "
-            "position before the trend has run its course, forcing re-entry at higher "
-            "prices and systematically missing compounding on multi-year winners. "
-            "The -3% stop-loss may also cause whipsaws but is kept unchanged this iteration "
-            "to isolate the take-profit effect."
-        ),
-        hypo=(
-            "Replacing the fixed +6% take-profit with a trailing stop at -10% from peak "
-            "allows winners to compound while still limiting reversal losses. "
-            "Expected: higher CAGR (more winner duration), slightly wider max-drawdown "
-            "(we give back up to 10% from peak before exiting), better Sharpe if alpha "
-            "from winner duration exceeds increased volatility."
-        ),
-        before=met_0,
-        after=met_1,
-        decision=decision_1,
-        reason=why_1,
-    )
-    print(note_1)
-
-    # ======================================================================
-    # ITERATION 2 — Widen stop-loss from -3% to -6% to reduce whipsaws
-    # ======================================================================
-    # Apply to the best config so far (cfg_1 if accepted, else cfg_0)
-    cfg_prev = cfg_1 if ok_1 else cfg_0
-    met_prev = met_1 if ok_1 else met_0
-
-    logger.info("\n── Iteration 2: Widen stop-loss from -3% to -6% ──")
-    cfg_2 = StrategyConfig(
-        stop_loss     = 0.06,             # WIDENED ← CHANGE
-        take_profit   = cfg_prev.take_profit,
-        trailing_stop = cfg_prev.trailing_stop,
-        cash_reserve  = 0.20,
-        max_positions = 8,
-        label="stop_6pct",
-    )
-    res_2 = run_experiment(cfg_2, cache, pinns, 2)
-    met_2 = collate_metrics(res_2)
-    history.append((2, "stop_6pct", met_2))
-    plot_iteration(res_2, 2, "stop_6pct")
-
-    ok_2, why_2 = accept(met_prev, met_2)
-    decision_2  = "ACCEPT" if ok_2 else "REJECT"
-    cfg_2_final = cfg_2 if ok_2 else cfg_prev
-    met_2_final = met_2 if ok_2 else met_prev
-
-    note_2 = research_note(
-        iteration=2,
-        cfg=cfg_2,
-        prev_cfg=cfg_prev,
-        obs=(
-            "A -3% stop-loss is narrower than typical daily noise for large-cap equities. "
-            "Normal intraday volatility of 1-2% means many stops are triggered by random "
-            "price variation rather than genuine trend reversals, causing whipsaw losses "
-            "that erode alpha. The trailing stop (if accepted in iter 1) already handles "
-            "reversal risk from the peak, making the tight hard stop doubly conservative."
-        ),
-        hypo=(
-            "Widening the hard stop-loss from -3% to -6% reduces whipsaw exits on "
-            "normal daily volatility. Combined with the trailing stop, the strategy "
-            "should experience fewer spurious exits while the trailing stop still "
-            "defends against genuine trend reversals."
-        ),
-        before=met_prev,
-        after=met_2,
-        decision=decision_2,
-        reason=why_2,
-    )
-    print(note_2)
-
-    # ======================================================================
-    # ITERATION 3 — Reduce cash reserve from 20% to 10% in bull regime
-    # ======================================================================
-    cfg_prev = cfg_2_final
-    met_prev = met_2_final
-
-    logger.info("\n── Iteration 3: Reduce cash reserve 20% → 10% ──")
-    cfg_3 = StrategyConfig(
-        stop_loss     = cfg_prev.stop_loss,
-        take_profit   = cfg_prev.take_profit,
-        trailing_stop = cfg_prev.trailing_stop,
-        cash_reserve  = 0.10,              # REDUCED ← CHANGE
-        max_positions = 8,
-        label="cash_10pct",
-    )
-    res_3 = run_experiment(cfg_3, cache, pinns, 3)
-    met_3 = collate_metrics(res_3)
-    history.append((3, "cash_10pct", met_3))
-    plot_iteration(res_3, 3, "cash_10pct")
-
-    ok_3, why_3 = accept(met_prev, met_3)
-    decision_3  = "ACCEPT" if ok_3 else "REJECT"
-    cfg_3_final = cfg_3 if ok_3 else cfg_prev
-    met_3_final = met_3 if ok_3 else met_prev
-
-    note_3 = research_note(
-        iteration=3,
-        cfg=cfg_3,
-        prev_cfg=cfg_prev,
-        obs=(
-            "Strategy keeps 20% in cash permanently. In bull markets this means only "
-            "80% of capital is at work even when 8 high-conviction signals are present. "
-            "SPY deploys 100% at all times. This structural underdeployment suppresses "
-            "CAGR without providing meaningful additional protection (circuit breakers "
-            "already protect against crash scenarios)."
-        ),
-        hypo=(
-            "Reducing cash reserve from 20% to 10% deploys an additional 10% of equity "
-            "into signals during bull markets. Expected: higher CAGR proportional to "
-            "market returns, slightly higher drawdown. Acceptable if drawdown stays ≤15%."
-        ),
-        before=met_prev,
-        after=met_3,
-        decision=decision_3,
-        reason=why_3,
-    )
-    print(note_3)
-
-    # ======================================================================
-    # ITERATION 4 — Increase max positions from 8 to 14
-    # ======================================================================
-    cfg_prev = cfg_3_final
-    met_prev = met_3_final
-
-    logger.info("\n── Iteration 4: Increase max positions 8 → 14 ──")
-    cfg_4 = StrategyConfig(
-        stop_loss     = cfg_prev.stop_loss,
-        take_profit   = cfg_prev.take_profit,
-        trailing_stop = cfg_prev.trailing_stop,
-        cash_reserve  = cfg_prev.cash_reserve,
-        max_positions = 14,                # INCREASED ← CHANGE
-        label="max_pos_14",
-    )
-    res_4 = run_experiment(cfg_4, cache, pinns, 4)
-    met_4 = collate_metrics(res_4)
-    history.append((4, "max_pos_14", met_4))
-    plot_iteration(res_4, 4, "max_pos_14")
-
-    ok_4, why_4 = accept(met_prev, met_4)
-    decision_4  = "ACCEPT" if ok_4 else "REJECT"
-
-    note_4 = research_note(
-        iteration=4,
-        cfg=cfg_4,
-        prev_cfg=cfg_prev,
         obs=(
             "With only 8 positions, idiosyncratic stock-level risk is high. A single "
             "bad pick in an 8-stock portfolio represents 12.5% weight. Increasing "
@@ -1077,6 +926,152 @@ def main():
             "returns, possible slight reduction in CAGR if top picks are diluted by "
             "lower-ranked signals."
         ),
+        before=met_0,
+        after=met_1,
+        decision=decision_1,
+        reason=why_1,
+    )
+    print(note_1)
+
+    # ======================================================================
+    # ITERATION 2 — Universe quality: UNIVERSE_40 + momentum ranking
+    # ======================================================================
+    cfg_prev = cfg_1_final
+    met_prev = met_1_final
+
+    logger.info("\n── Iteration 2: Universe 40 stocks + momentum ranking ──")
+    cfg_2 = StrategyConfig(
+        max_positions      = cfg_prev.max_positions,
+        universe           = UNIVERSE_40,   # ← CHANGE
+        momentum_rank      = True,          # ← CHANGE
+        bear_recovery_mode = False,
+        label="universe40_momentum",
+    )
+    res_2 = run_experiment(cfg_2, cache, pinns, 2)
+    met_2 = collate_metrics(res_2)
+    history.append((2, "universe40_momentum", met_2))
+    plot_iteration(res_2, 2, "universe40_momentum")
+
+    ok_2, why_2 = accept(met_prev, met_2)
+    decision_2  = "ACCEPT" if ok_2 else "REJECT"
+    cfg_2_final = cfg_2 if ok_2 else cfg_prev
+    met_2_final = met_2 if ok_2 else met_prev
+
+    note_2 = research_note(
+        iteration=2,
+        cfg=cfg_2,
+        prev_cfg=cfg_prev,
+        obs=(
+            "The 20-stock universe ranks buy candidates by Merton ratio, but does not "
+            "incorporate cross-sectional momentum. The Jegadeesh–Titman momentum factor "
+            "is one of the most replicated anomalies in empirical finance: stocks with "
+            "strong 6-12 month returns tend to continue outperforming over the next "
+            "3-12 months. Our EMA entry already filters for trend; we don't yet "
+            "prioritise among candidates by trend strength."
+        ),
+        hypo=(
+            "Expanding to 40 large-cap stocks (all pre-2001 IPOs, market-cap-selected) "
+            "and ranking candidates by 6-month prior return instead of Merton ratio "
+            "should improve stock selection alpha. Expected: higher CAGR and Sharpe "
+            "from better candidate ranking; minimal drawdown impact since the universe "
+            "remains large-cap S&P 100 constituents."
+        ),
+        before=met_prev,
+        after=met_2,
+        decision=decision_2,
+        reason=why_2,
+    )
+    print(note_2)
+
+    # ======================================================================
+    # ITERATION 3 — Bear recovery mode
+    # ======================================================================
+    cfg_prev = cfg_2_final
+    met_prev = met_2_final
+
+    logger.info("\n── Iteration 3: Bear recovery mode ──")
+    cfg_3 = StrategyConfig(
+        max_positions      = cfg_prev.max_positions,
+        universe           = cfg_prev.universe,
+        momentum_rank      = cfg_prev.momentum_rank,
+        bear_recovery_mode = True,   # ← CHANGE
+        label="bear_recovery",
+    )
+    res_3 = run_experiment(cfg_3, cache, pinns, 3)
+    met_3 = collate_metrics(res_3)
+    history.append((3, "bear_recovery", met_3))
+    plot_iteration(res_3, 3, "bear_recovery")
+
+    ok_3, why_3 = accept(met_prev, met_3)
+    decision_3  = "ACCEPT" if ok_3 else "REJECT"
+    cfg_3_final = cfg_3 if ok_3 else cfg_prev
+    met_3_final = met_3 if ok_3 else met_prev
+
+    note_3 = research_note(
+        iteration=3,
+        cfg=cfg_3,
+        prev_cfg=cfg_prev,
+        obs=(
+            "In the 2009 recovery (March–December), 2020 V-shaped rebound (April–August), "
+            "and 2022–2023 the strategy sat in cash for months after the price bottom "
+            "because the EMA50 > EMA20 crossover didn't fire until well into the recovery. "
+            "These missed recoveries account for a significant fraction of the CAGR gap vs SPY."
+        ),
+        hypo=(
+            "Adding a secondary bear entry (price > EMA20 AND RSI < 35) catches early "
+            "recovery without requiring the slow EMA crossover. RSI < 35 prevents catching "
+            "falling knives. The trailing stop still limits reversal losses. "
+            "Expected: higher CAGR in years following market bottoms, small trade-count increase."
+        ),
+        before=met_prev,
+        after=met_3,
+        decision=decision_3,
+        reason=why_3,
+    )
+    print(note_3)
+
+    # ======================================================================
+    # ITERATION 4 — Sector cap on UNIVERSE_40 + momentum
+    # ======================================================================
+    cfg_prev = cfg_3_final
+    met_prev = met_3_final
+
+    logger.info("\n── Iteration 4: UNIVERSE_40 + momentum + sector cap (3/sector) ──")
+    cfg_4 = StrategyConfig(
+        max_positions      = cfg_prev.max_positions,
+        universe           = UNIVERSE_40,
+        momentum_rank      = True,
+        bear_recovery_mode = cfg_prev.bear_recovery_mode,
+        sector_max_pos     = 3,   # ← CHANGE
+        label="universe40_mom_sector3",
+    )
+    res_4 = run_experiment(cfg_4, cache, pinns, 4)
+    met_4 = collate_metrics(res_4)
+    history.append((4, "universe40_mom_sector3", met_4))
+    plot_iteration(res_4, 4, "universe40_mom_sector3")
+
+    ok_4, why_4 = accept(met_prev, met_4)
+    decision_4  = "ACCEPT" if ok_4 else "REJECT"
+    cfg_4_final = cfg_4 if ok_4 else cfg_prev
+    met_4_final = met_4 if ok_4 else met_prev
+
+    note_4 = research_note(
+        iteration=4,
+        cfg=cfg_4,
+        prev_cfg=cfg_prev,
+        obs=(
+            "UNIVERSE_40 + momentum (Iter 2) may have been rejected due to sector "
+            "clustering: during tech bull runs (2003-2007, 2012-2015, 2020-2021) pure "
+            "momentum selects 7-9 names from Technology + Healthcare alone. A single "
+            "sector shock draws down the entire portfolio simultaneously."
+        ),
+        hypo=(
+            "Capping at 3 positions per GICS sector (applied after momentum sort) "
+            "forces diversification across at least 5 sectors in a 14-slot portfolio. "
+            "The highest-momentum stock per sector is still preferred, preserving "
+            "cross-sectional alpha. Expected: MaxDD returns to Iter 1 levels, "
+            "CAGR benefit from larger universe + momentum retained."
+        ),
         before=met_prev,
         after=met_4,
         decision=decision_4,
@@ -1085,41 +1080,27 @@ def main():
     print(note_4)
 
     # ======================================================================
-    # ITERATION 5 — Universe quality: UNIVERSE_40 + momentum ranking
+    # ITERATION 5 — Dynamic γ: bull regime γ=1.5 (doubles PINN π* in bull)
     # ======================================================================
-    # Attribution:
-    #   The current 20-stock universe was chosen for data availability and sector
-    #   diversity, but does not rank candidates by recent momentum. Academic
-    #   literature (Jegadeesh & Titman 1993; Fama & French 2012) shows robust
-    #   6-12 month momentum premium across markets. Expanding to 40 stocks and
-    #   ranking by 6-month prior return (instead of Merton ratio) biases the
-    #   opportunity set toward stocks already in trend, which aligns with the
-    #   EMA-based entry signal.
-    #
-    #   Isolated changes: universe UNIVERSE_40, momentum_rank=True.
-    #   All risk parameters from best prior config.
-    # ======================================================================
-    cfg_4_final = cfg_4 if ok_4 else cfg_3_final
-    met_4_final = met_4 if ok_4 else met_3_final
-    cfg_prev    = cfg_4_final
-    met_prev    = met_4_final
+    cfg_prev = cfg_4_final
+    met_prev = met_4_final
 
-    logger.info("\n── Iteration 5: Universe 40 stocks + momentum ranking ──")
+    logger.info("\n── Iteration 5: Dynamic γ — bull γ=1.5, bear γ=3.0 ──")
     cfg_5 = StrategyConfig(
-        stop_loss          = cfg_prev.stop_loss,
-        take_profit        = cfg_prev.take_profit,
-        trailing_stop      = cfg_prev.trailing_stop,
-        cash_reserve       = cfg_prev.cash_reserve,
         max_positions      = cfg_prev.max_positions,
-        universe           = UNIVERSE_40,   # EXPANDED ← CHANGE
-        momentum_rank      = True,          # ENABLED  ← CHANGE
-        bear_recovery_mode = False,
-        label="universe40_momentum",
+        bear_recovery_mode = cfg_prev.bear_recovery_mode,
+        universe           = cfg_prev.universe,
+        momentum_rank      = cfg_prev.momentum_rank,
+        sector_max_pos     = cfg_prev.sector_max_pos,
+        gamma_bull         = 1.5,   # ← CHANGE
+        vol_target         = 0.0,
+        inv_vol_weight     = False,
+        label="gamma_bull_1_5",
     )
     res_5 = run_experiment(cfg_5, cache, pinns, 5)
     met_5 = collate_metrics(res_5)
-    history.append((5, "universe40_momentum", met_5))
-    plot_iteration(res_5, 5, "universe40_momentum")
+    history.append((5, "gamma_bull_1_5", met_5))
+    plot_iteration(res_5, 5, "gamma_bull_1_5")
 
     ok_5, why_5 = accept(met_prev, met_5)
     decision_5  = "ACCEPT" if ok_5 else "REJECT"
@@ -1131,20 +1112,17 @@ def main():
         cfg=cfg_5,
         prev_cfg=cfg_prev,
         obs=(
-            "The 20-stock universe ranks buy candidates by Merton ratio (a forward-looking "
-            "measure of risk-adjusted drift), but does not incorporate cross-sectional "
-            "momentum. The Jegadeesh–Titman momentum factor is one of the most replicated "
-            "anomalies in empirical finance: stocks with strong 6-12 month returns tend to "
-            "continue outperforming over the next 3-12 months. Our entry signal (EMA fast > "
-            "slow) already filters for trend, but we don't prioritise among candidates by "
-            "trend strength."
+            "The PINN is trained at CRRA γ=3.0, producing π*≈0.42 in typical bull "
+            "markets. SPY is 100% deployed always. This ~58% structural underdeployment "
+            "costs ~7% CAGR annually in a bull that returns 13%. The Merton ratio is "
+            "linear in 1/γ, so scaling π* by (γ_bear/γ_bull) is a mathematically "
+            "valid approximation of retraining at γ=1.5."
         ),
         hypo=(
-            "Expanding to 40 large-cap stocks (all pre-2001 IPOs, market-cap-selected — not "
-            "backtest-selected) and ranking candidates by 6-month prior return instead of "
-            "Merton ratio should improve stock selection alpha. Expected: higher CAGR and "
-            "Sharpe from better candidate ranking, minimal impact on drawdown since the "
-            "universe is still large-cap S&P 100 constituents."
+            "Setting γ_bull=1.5 scales the PINN output by 2× in confirmed bull regimes, "
+            "raising effective deployment from ~42% to ~84%. Bear and crash regimes use "
+            "γ=3.0 unchanged — full risk protection preserved. Expected: CAGR +3-5% in "
+            "bull-dominated periods; MaxDD bounded by trailing stop."
         ),
         before=met_prev,
         after=met_5,
@@ -1154,64 +1132,49 @@ def main():
     print(note_5)
 
     # ======================================================================
-    # ITERATION 6 — Bear recovery mode
-    # ======================================================================
-    # Attribution:
-    #   The strategy misses the early phase of bear market recoveries. The EMA
-    #   crossover requirement (fast > slow) takes 50-100 trading days to flip
-    #   after a price bottom — by which time SPY and individual stocks have already
-    #   recovered 15-30% from their lows. The strategy either re-enters at the top
-    #   of the recovery or stays in cash through the entire move.
-    #
-    #   The existing bear entry (RSI < 30 + EMA cross) is structurally unable to
-    #   catch recoveries because the slow EMA lags price by its full window length.
-    #   Adding an alternative trigger: price > EMA20 + RSI < 35 catches early
-    #   recovery without relaxing the crash protection (we still check PINN alloc).
-    #
-    #   Isolated change: bear_recovery_mode=True. Everything else from best prior.
+    # ITERATION 6 — Volatility targeting: scale by (15% / realized_vol)
     # ======================================================================
     cfg_prev = cfg_5_final
     met_prev = met_5_final
 
-    logger.info("\n── Iteration 6: Bear recovery mode ──")
+    logger.info("\n── Iteration 6: Volatility targeting at 15% ann. vol ──")
     cfg_6 = StrategyConfig(
-        stop_loss          = cfg_prev.stop_loss,
-        take_profit        = cfg_prev.take_profit,
-        trailing_stop      = cfg_prev.trailing_stop,
-        cash_reserve       = cfg_prev.cash_reserve,
         max_positions      = cfg_prev.max_positions,
+        bear_recovery_mode = cfg_prev.bear_recovery_mode,
         universe           = cfg_prev.universe,
         momentum_rank      = cfg_prev.momentum_rank,
-        bear_recovery_mode = True,          # ENABLED ← CHANGE
-        label="bear_recovery",
+        sector_max_pos     = cfg_prev.sector_max_pos,
+        gamma_bull         = cfg_prev.gamma_bull,
+        vol_target         = 0.15,   # ← CHANGE
+        inv_vol_weight     = False,
+        label="vol_target_15pct",
     )
     res_6 = run_experiment(cfg_6, cache, pinns, 6)
     met_6 = collate_metrics(res_6)
-    history.append((6, "bear_recovery", met_6))
-    plot_iteration(res_6, 6, "bear_recovery")
+    history.append((6, "vol_target_15pct", met_6))
+    plot_iteration(res_6, 6, "vol_target_15pct")
 
     ok_6, why_6 = accept(met_prev, met_6)
     decision_6  = "ACCEPT" if ok_6 else "REJECT"
+    cfg_6_final = cfg_6 if ok_6 else cfg_prev
+    met_6_final = met_6 if ok_6 else met_prev
 
     note_6 = research_note(
         iteration=6,
         cfg=cfg_6,
         prev_cfg=cfg_prev,
         obs=(
-            "In the 2009 recovery (March–December), in the 2020 V-shaped rebound "
-            "(April–August), and in 2022–2023 the strategy sat in cash or bear-mode "
-            "for months after the price bottom because the EMA50 > EMA20 crossover "
-            "didn't fire until well into the recovery. These missed recoveries are "
-            "responsible for a significant fraction of the ~2–5% annual CAGR gap vs SPY."
+            "Iter 5 (dynamic γ) significantly increases bull-market deployment. Without "
+            "a risk control, this may cause MaxDD spikes if a bull market turns sharply "
+            "before the regime smoother confirms the change. Volatility targeting "
+            "continuously scales allocation to maintain constant realized portfolio risk."
         ),
         hypo=(
-            "Adding a secondary bear entry condition (price > EMA20 AND RSI < 35) "
-            "allows the strategy to enter early in a recovery without requiring the "
-            "slow EMA crossover. RSI < 35 acts as an oversold filter to prevent "
-            "catching falling knives — we only enter after a short-term trend turn "
-            "has begun. The trailing stop still limits reversal losses. "
-            "Expected: higher CAGR in years following market bottoms, small increase "
-            "in trade count."
+            "Targeting 15% annualized portfolio vol (scale = 15%/realized_vol, "
+            "clipped to [0.5, 1.5]): in low-vol bull markets scale approaches 1.5×, "
+            "increasing deployment; in high-vol bear markets scale drops toward 0.5×, "
+            "de-leveraging before circuit breakers fire. Expected: MaxDD controlled "
+            "relative to Iter 5 while retaining most CAGR improvement."
         ),
         before=met_prev,
         after=met_6,
@@ -1221,43 +1184,27 @@ def main():
     print(note_6)
 
     # ======================================================================
-    # ITERATION 7 — Sector diversification cap on UNIVERSE_40 + momentum
+    # ITERATION 7 — Inverse-volatility weighting replaces Merton sizing
     # ======================================================================
-    # Attribution:
-    #   Iter 5 (UNIVERSE_40 + momentum ranking) was REJECTED because MaxDD blew
-    #   to -15.4%/-17.1%/-17.2% across all periods — exactly the sector clustering
-    #   problem predicted: pure momentum ranking loads all slots into the same
-    #   industry during a strong trend (e.g. 7 tech + 5 healthcare in 2003-2007).
-    #
-    #   Fix: cap positions per GICS sector at 3, applied after momentum sort so the
-    #   highest-momentum stock in each sector is still preferred. This preserves the
-    #   momentum selection benefit while breaking the correlated drawdown.
-    #
-    #   Isolated change from Iter 5 config: add sector_max_pos=3.
-    #   Everything else from best prior config (Iter 6 accepted → use cfg_6 if ok).
-    # ======================================================================
-    cfg_6_final = cfg_6 if ok_6 else cfg_5_final
-    met_6_final = met_6 if ok_6 else met_5_final
-    cfg_prev    = cfg_6_final
-    met_prev    = met_6_final
+    cfg_prev = cfg_6_final
+    met_prev = met_6_final
 
-    logger.info("\n── Iteration 7: UNIVERSE_40 + momentum + sector cap (3/sector) ──")
+    logger.info("\n── Iteration 7: Inverse-vol weighting (1/σ) replaces Merton sizing ──")
     cfg_7 = StrategyConfig(
-        stop_loss          = cfg_prev.stop_loss,
-        take_profit        = cfg_prev.take_profit,
-        trailing_stop      = cfg_prev.trailing_stop,
-        cash_reserve       = cfg_prev.cash_reserve,
         max_positions      = cfg_prev.max_positions,
-        universe           = UNIVERSE_40,   # EXPANDED (same as Iter 5)
-        momentum_rank      = True,          # ENABLED  (same as Iter 5)
         bear_recovery_mode = cfg_prev.bear_recovery_mode,
-        sector_max_pos     = 3,             # CAP ← CHANGE (new vs Iter 5)
-        label="universe40_mom_sector3",
+        universe           = cfg_prev.universe,
+        momentum_rank      = cfg_prev.momentum_rank,
+        sector_max_pos     = cfg_prev.sector_max_pos,
+        gamma_bull         = cfg_prev.gamma_bull,
+        vol_target         = cfg_prev.vol_target,
+        inv_vol_weight     = True,   # ← CHANGE
+        label="inv_vol_weight",
     )
     res_7 = run_experiment(cfg_7, cache, pinns, 7)
     met_7 = collate_metrics(res_7)
-    history.append((7, "universe40_mom_sector3", met_7))
-    plot_iteration(res_7, 7, "universe40_mom_sector3")
+    history.append((7, "inv_vol_weight", met_7))
+    plot_iteration(res_7, 7, "inv_vol_weight")
 
     ok_7, why_7 = accept(met_prev, met_7)
     decision_7  = "ACCEPT" if ok_7 else "REJECT"
@@ -1267,20 +1214,19 @@ def main():
         cfg=cfg_7,
         prev_cfg=cfg_prev,
         obs=(
-            "Iter 5 (UNIVERSE_40 + momentum) was rejected: MaxDD exceeded 15% in all "
-            "three periods. Post-hoc attribution: during tech bull runs (2003-2007, "
-            "2012-2015, 2020-2021) the momentum filter selects the top 14 names, which "
-            "are often 7-9 stocks from Technology + Healthcare alone. When a sector-specific "
-            "shock hits, the entire portfolio draws down together — a variance level the "
-            "PINN's Heston/GBM parameters are not calibrated to handle."
+            "Merton ratio π*_i = (μ_i - r)/(γσ_i²) sizes positions by estimated "
+            "risk-adjusted return. But μ estimated from 90-day daily data has "
+            "signal-to-noise ≈ σ/√N ≈ 20%/√90 ≈ 2.1% vs expected excess return ~5%. "
+            "The μ estimate is noise-dominated — Merton sizing is effectively random. "
+            "Inverse-vol (1/σ_i / Σ(1/σ_j)) contributes equal variance per position "
+            "without relying on unreliable return estimates."
         ),
         hypo=(
-            "Adding a sector cap of 3 positions per GICS sector, applied after the "
-            "momentum sort, forces diversification across at least 5 sectors in a "
-            "14-slot portfolio. The highest-momentum stock per sector is still chosen, "
-            "preserving cross-sectional alpha. Expected: MaxDD returns to Iter 4 levels "
-            "(-13 to -15%), CAGR benefit from larger universe and momentum ranking is "
-            "retained since each sector's best momentum stock still fills its 3 slots."
+            "Replacing Merton-ratio sizing with inverse-vol weights provides more stable "
+            "position sizes. Low-vol stocks get larger allocations; high-vol stocks get "
+            "smaller. This reduces idiosyncratic risk concentration. Expected: lower "
+            "MaxDD, more consistent trade outcomes, modest Sharpe improvement from "
+            "reduced variance drag."
         ),
         before=met_prev,
         after=met_7,
@@ -1290,210 +1236,35 @@ def main():
     print(note_7)
 
     # ======================================================================
-    # ITERATION 8 — Dynamic γ: bull regime γ=1.5 (doubles PINN π* in bull)
-    # ======================================================================
-    cfg_7_final = cfg_7 if ok_7 else cfg_6_final
-    met_7_final = met_7 if ok_7 else met_6_final
-    cfg_prev    = cfg_7_final
-    met_prev    = met_7_final
-
-    logger.info("\n── Iteration 8: Dynamic γ — bull γ=1.5, bear γ=3.0 ──")
-    cfg_8 = StrategyConfig(
-        stop_loss          = cfg_prev.stop_loss,
-        take_profit        = cfg_prev.take_profit,
-        trailing_stop      = cfg_prev.trailing_stop,
-        cash_reserve       = cfg_prev.cash_reserve,
-        max_positions      = cfg_prev.max_positions,
-        bear_recovery_mode = cfg_prev.bear_recovery_mode,
-        gamma_bull         = 1.5,    # ← CHANGE: scale π* × 2 in confirmed bull
-        vol_target         = 0.0,
-        inv_vol_weight     = False,
-        label="gamma_bull_1_5",
-    )
-    res_8 = run_experiment(cfg_8, cache, pinns, 8)
-    met_8 = collate_metrics(res_8)
-    history.append((8, "gamma_bull_1_5", met_8))
-    plot_iteration(res_8, 8, "gamma_bull_1_5")
-
-    ok_8, why_8 = accept(met_prev, met_8)
-    decision_8  = "ACCEPT" if ok_8 else "REJECT"
-    cfg_8_final = cfg_8 if ok_8 else cfg_prev
-    met_8_final = met_8 if ok_8 else met_prev
-
-    note_8 = research_note(
-        iteration=8,
-        cfg=cfg_8,
-        prev_cfg=cfg_prev,
-        obs=(
-            "The PINN is trained at CRRA γ=3.0, producing π*≈0.42 in typical bull "
-            "markets. SPY is 100% deployed always. This ~58% structural underdeployment "
-            "costs ~7% CAGR annually in a bull that returns 13%. No amount of stock "
-            "selection alpha reliably overcomes a 7% structural headwind. The Merton "
-            "ratio is linear in 1/γ, so scaling π* by (γ_bear/γ_bull) is a "
-            "mathematically valid approximation of retraining at γ=1.5."
-        ),
-        hypo=(
-            "Setting γ_bull=1.5 scales the PINN output by 2× in confirmed bull "
-            "regimes, raising effective deployment from ~42% to ~84%. Bear and crash "
-            "regimes use γ=3.0 unchanged — full risk protection preserved. "
-            "Expected: CAGR +3-5% in periods dominated by bull markets; MaxDD increases "
-            "are bounded since the trailing stop still limits per-position reversal losses."
-        ),
-        before=met_prev,
-        after=met_8,
-        decision=decision_8,
-        reason=why_8,
-    )
-    print(note_8)
-
-    # ======================================================================
-    # ITERATION 9 — Volatility targeting: scale by (15% / realized_vol)
-    # ======================================================================
-    cfg_prev = cfg_8_final
-    met_prev = met_8_final
-
-    logger.info("\n── Iteration 9: Volatility targeting at 15% ann. vol ──")
-    cfg_9 = StrategyConfig(
-        stop_loss          = cfg_prev.stop_loss,
-        take_profit        = cfg_prev.take_profit,
-        trailing_stop      = cfg_prev.trailing_stop,
-        cash_reserve       = cfg_prev.cash_reserve,
-        max_positions      = cfg_prev.max_positions,
-        bear_recovery_mode = cfg_prev.bear_recovery_mode,
-        gamma_bull         = cfg_prev.gamma_bull,
-        vol_target         = 0.15,   # ← CHANGE: target 15% ann. portfolio vol
-        inv_vol_weight     = False,
-        label="vol_target_15pct",
-    )
-    res_9 = run_experiment(cfg_9, cache, pinns, 9)
-    met_9 = collate_metrics(res_9)
-    history.append((9, "vol_target_15pct", met_9))
-    plot_iteration(res_9, 9, "vol_target_15pct")
-
-    ok_9, why_9 = accept(met_prev, met_9)
-    decision_9  = "ACCEPT" if ok_9 else "REJECT"
-    cfg_9_final = cfg_9 if ok_9 else cfg_prev
-    met_9_final = met_9 if ok_9 else met_prev
-
-    note_9 = research_note(
-        iteration=9,
-        cfg=cfg_9,
-        prev_cfg=cfg_prev,
-        obs=(
-            "Iter 8 (dynamic γ) increases bull-market deployment significantly. "
-            "Without a risk control, this may cause MaxDD spikes if a bull market "
-            "turns sharply before the regime smoother confirms the regime change. "
-            "Volatility targeting addresses this by continuously scaling allocation "
-            "to maintain constant realized portfolio risk. This is the core mechanism "
-            "of AQR's Managed Futures and BlackRock's MVCS products."
-        ),
-        hypo=(
-            "Targeting 15% annualized portfolio vol (scale = 15%/realized_vol, "
-            "clipped to [0.5, 1.5]): in low-vol bull markets scale approaches 1.5×, "
-            "increasing deployment; in high-vol bear markets scale drops toward 0.5×, "
-            "de-leveraging before circuit breakers fire. Expected: MaxDD controlled "
-            "relative to Iter 8 while retaining most CAGR improvement."
-        ),
-        before=met_prev,
-        after=met_9,
-        decision=decision_9,
-        reason=why_9,
-    )
-    print(note_9)
-
-    # ======================================================================
-    # ITERATION 10 — Inverse-volatility weighting replaces Merton sizing
-    # ======================================================================
-    cfg_prev = cfg_9_final
-    met_prev = met_9_final
-
-    logger.info("\n── Iteration 10: Inverse-vol weighting (1/σ) replaces Merton sizing ──")
-    cfg_10 = StrategyConfig(
-        stop_loss          = cfg_prev.stop_loss,
-        take_profit        = cfg_prev.take_profit,
-        trailing_stop      = cfg_prev.trailing_stop,
-        cash_reserve       = cfg_prev.cash_reserve,
-        max_positions      = cfg_prev.max_positions,
-        bear_recovery_mode = cfg_prev.bear_recovery_mode,
-        gamma_bull         = cfg_prev.gamma_bull,
-        vol_target         = cfg_prev.vol_target,
-        inv_vol_weight     = True,   # ← CHANGE: size by 1/σ rather than Merton ratio
-        label="inv_vol_weight",
-    )
-    res_10 = run_experiment(cfg_10, cache, pinns, 10)
-    met_10 = collate_metrics(res_10)
-    history.append((10, "inv_vol_weight", met_10))
-    plot_iteration(res_10, 10, "inv_vol_weight")
-
-    ok_10, why_10 = accept(met_prev, met_10)
-    decision_10   = "ACCEPT" if ok_10 else "REJECT"
-
-    note_10 = research_note(
-        iteration=10,
-        cfg=cfg_10,
-        prev_cfg=cfg_prev,
-        obs=(
-            "Merton ratio π*_i = (μ_i - r)/(γσ_i²) sizes positions by estimated "
-            "risk-adjusted return. But μ estimated from 90-260 day daily data has "
-            "signal-to-noise ratio ≈ σ/√N ≈ 20%/√260 ≈ 1.2%, compared to expected "
-            "excess return ~5%. The μ estimate is swamped by noise — Merton sizing "
-            "is effectively random. Inverse-volatility (1/σ_i / Σ(1/σ_j)) is "
-            "the risk-parity-lite equivalent: size each position to contribute "
-            "equal variance, ignoring unreliable return estimates."
-        ),
-        hypo=(
-            "Replacing Merton-ratio sizing with inverse-vol weights (1/σ) provides "
-            "more stable position sizes across the portfolio. Low-vol stocks get "
-            "larger allocations; high-vol stocks get smaller. This reduces "
-            "idiosyncratic risk concentration. Expected: lower Max DD, more "
-            "consistent trade outcomes, modest Sharpe improvement from reduced "
-            "variance drag."
-        ),
-        before=met_prev,
-        after=met_10,
-        decision=decision_10,
-        reason=why_10,
-    )
-    print(note_10)
-
-    # ======================================================================
     # Summary
     # ======================================================================
     plot_summary_table(history)
 
-    cfg_10_final = cfg_10 if ok_10 else cfg_9_final
-    best_cfg  = (cfg_10_final if ok_10 else cfg_9_final if ok_9 else
-                 cfg_8_final  if ok_8  else cfg_7_final  if ok_7  else
-                 cfg_6_final  if ok_6  else cfg_5_final  if ok_5  else
-                 cfg_4_final  if ok_4  else cfg_3_final  if ok_3  else
-                 cfg_2_final  if ok_2  else cfg_1         if ok_1  else cfg_0)
-    best_iter = (10 if ok_10 else 9 if ok_9 else 8 if ok_8 else 7 if ok_7 else
-                 6  if ok_6  else 5 if ok_5 else 4 if ok_4 else 3 if ok_3 else
-                 2  if ok_2  else 1 if ok_1 else 0)
+    cfg_7_final = cfg_7 if ok_7 else cfg_6_final
+    best_cfg = (cfg_7_final if ok_7 else cfg_6_final if ok_6 else
+                cfg_5_final if ok_5 else cfg_4_final if ok_4 else
+                cfg_3_final if ok_3 else cfg_2_final if ok_2 else
+                cfg_1_final if ok_1 else cfg_0)
+    best_iter = (7 if ok_7 else 6 if ok_6 else 5 if ok_5 else 4 if ok_4 else
+                 3 if ok_3 else 2 if ok_2 else 1 if ok_1 else 0)
 
     logger.info(f"\n{'='*65}")
     logger.info(f"Research loop complete. Best config: Iteration {best_iter} — {best_cfg.label}")
     logger.info("Accepted changes:")
     if ok_1:
-        logger.info("  ✓ Iter 1:  Trailing stop -10% replaced fixed take-profit")
+        logger.info("  ✓ Iter 1: Max positions increased to 14")
     if ok_2:
-        logger.info("  ✓ Iter 2:  Stop-loss widened to -6%")
+        logger.info("  ✓ Iter 2: Universe expanded to 40 stocks + momentum ranking")
     if ok_3:
-        logger.info("  ✓ Iter 3:  Cash reserve reduced to 10%")
+        logger.info("  ✓ Iter 3: Bear recovery mode enabled")
     if ok_4:
-        logger.info("  ✓ Iter 4:  Max positions increased to 14")
+        logger.info("  ✓ Iter 4: Sector cap 3/sector + UNIVERSE_40 + momentum")
     if ok_5:
-        logger.info("  ✓ Iter 5:  Universe expanded to 40 stocks + momentum ranking")
+        logger.info("  ✓ Iter 5: Dynamic γ — bull γ=1.5 (doubles PINN deployment)")
     if ok_6:
-        logger.info("  ✓ Iter 6:  Bear recovery mode enabled")
+        logger.info("  ✓ Iter 6: Volatility targeting at 15% ann. vol")
     if ok_7:
-        logger.info("  ✓ Iter 7:  Sector cap 3/sector + UNIVERSE_40 + momentum")
-    if ok_8:
-        logger.info("  ✓ Iter 8:  Dynamic γ — bull γ=1.5 (doubles PINN deployment)")
-    if ok_9:
-        logger.info("  ✓ Iter 9:  Volatility targeting at 15% ann. vol")
-    if ok_10:
-        logger.info("  ✓ Iter 10: Inverse-vol weighting replaces Merton sizing")
+        logger.info("  ✓ Iter 7: Inverse-vol weighting replaces Merton sizing")
     logger.info(f"Research log: {LOG_FILE}")
     logger.info(f"Graphs: {GRAPHS_DIR}/research_iter_*.png + research_summary.png")
 

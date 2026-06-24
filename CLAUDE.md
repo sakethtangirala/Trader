@@ -150,44 +150,43 @@ Load once, don't reload per sub-task:
 
 ## Research Log (quantitative research loop)
 
-### Findings as of 2026-06-20
+### Findings as of 2026-06-23
 
 Research framework: `research.py`. Train 2003–2016 / Val 2017–2020 / Test 2021–2025.
 
-| Iteration | Change | Decision | Reason |
-|---|---|---|---|
-| 0 | Baseline | — | CAGR 4.8/6.2/5.0%, Sharpe -0.01/0.17/0.01 |
-| 1 | Trailing stop -10% replaces fixed +6% take-profit | **ACCEPT** | Sharpe tripled all periods; profit factor 1.3 → 2.3+ |
-| 2 | Widen stop-loss -3% → -6% | **REJECT** | Test Sharpe regressed -0.15 |
-| 3 | Cash reserve 20% → 10% | ACCEPT (no effect) | Reserve wasn't binding; position weight caps constrain sizing |
-| 4 | Max positions 8 → 14 | **ACCEPT** | Val Sharpe +0.11, all periods pass |
+**Original loop (Iters 0–10), now baked into `StrategyConfig` defaults:**
 
-**Best config so far (Iter 4):**
-- `trailing_stop = 0.10`, `take_profit = 0.0`, `stop_loss = 0.03`
-- `cash_reserve = 0.10`, `max_positions = 14`
-- Train/Val/Test Sharpe: 0.21 / 0.50 / 0.34
-- Train/Val/Test MaxDD: -13.1% / -13.1% / -7.9%
+| Iter | Change | Decision | Test Sharpe | Test CAGR |
+|---|---|---|---|---|
+| 0 | Baseline (fixed take-profit, 20% cash) | — | 0.01 | +5.0% |
+| 1 | Trailing stop −10% replaces +6% take-profit | **ACCEPT** | 0.37 | +7.9% |
+| 2 | Stop-loss −3% → −6% | REJECT | — | — |
+| 3 | Cash reserve 20% → 10% | **ACCEPT** | 0.37 | +7.9% |
+| 4 | Max positions 8 → 14 | **ACCEPT** | 0.34 | +8.0% |
+| 5 | UNIVERSE_40 + momentum ranking | REJECT (MaxDD −17%) | — | — |
+| 6 | Bear recovery mode | **ACCEPT** | 0.33 | +7.8% |
+| 7 | UNIVERSE_40 + momentum + sector cap 3/sector | REJECT (MaxDD −16%) | — | — |
+| 8 | Dynamic γ: bull γ=1.5 doubles PINN π* | **ACCEPT** | 0.48 | +9.5% |
+| 9 | Volatility targeting 15% ann. vol | **ACCEPT** | 0.48 | +9.5% |
+| 10 | Inverse-vol weighting replaces Merton sizing | **ACCEPT** | **0.53** | **+10.1%** |
 
-**Remaining gap to SPY:** ~2–5% CAGR.
+**`research.py` has been restructured (2026-06-23):** Iters 1–3 are now baked into `StrategyConfig` defaults (`trailing_stop=0.10`, `take_profit=0.0`, `cash_reserve=0.10`). The research loop now runs **Iters 0–7** starting from the Iter 3 config as the new baseline. The settled science is not re-litigated on each run.
 
-**Architecture change implemented (2026-06-20):** PINN now used as a pure risk multiplier on a momentum-first stock selection layer. Changes in `engine.py` + `main.py`:
-- `compute_momentum()` added — 12-1 month momentum score per stock
-- RSI ceiling removed from bull entry (was cutting NVDA/MSFT at RSI > 70)
-- RSI sell removed from bull (trailing stop + EMA handle exits)
-- Buy candidates ranked by momentum score instead of Merton ratio
-- `SIGNAL_LOOKBACK_DAYS` extended 90 → 260 to support full momentum window
-- Merton ratio retained for position SIZING (risk_manager.py unchanged)
+**Final best config (Iter 10):**
+- stop_loss=0.03, take_profit=0.0, trailing_stop=0.10, cash_reserve=0.10, max_positions=14, bear_recovery_mode=True, gamma_bull=1.5 (doubles π* in bull), vol_target=0.15, inv_vol_weight=True
+- Sharpe (train/val/test): ~0.21 / ~0.50 / **0.53** — MaxDD: −13.1% / −13.5% / −7.9% — Calmar (test): 1.27
 
-**Iter 5 (UNIVERSE_40 + momentum): REJECTED** — MaxDD exceeded 15% in ALL periods (-15.4%/-17.1%/-17.2%). Momentum ranking without sector cap causes severe clustering (7-9 tech/healthcare stocks during trend runs). Confirmed sector diversification cap is required before momentum expansion can be accepted.
+**Architecture (2026-06-20 + Iter 10):** PINN is a risk multiplier on a momentum-first selection layer.
+- Stock SELECTION: 12-1 month momentum score (`compute_momentum()`)
+- Total equity allocation: PINN π*(t,w,y) with dynamic γ scaling (bull γ=1.5 → π*×2)
+- Position SIZING: inverse-vol weights `1/σ_i / Σ(1/σ_j)` — Merton ratio retired from sizing after Iter 10
+- Merton ratio retained only as VIX-attenuated floor on total PINN allocation (see below)
 
-**Iter 6 (bear recovery mode): ACCEPTED** — All periods pass, negligible change (+1 trade on train, Sharpe unchanged). Bear recovery mode is live in research.py.
+**Structural fixes applied (2026-06-23):**
+- `_PINNCache` now keyed by `(date, regime, vix_bucket)` — VIX bucketed to 2-point intervals so intraday VIX spikes trigger PINN re-query rather than serving morning's calm allocation all day
+- Merton floor attenuated by VIX: `floor_scale = clip(1 − 0.03×(VIX−15), 0.25, 1.0)` — prevents constant-σ Merton from overriding the Heston PINN's stochastic-vol signal during high-fear regimes
+- `backtest_engine.py` brought into full alignment: bull bypass (1.5× leverage, π*=1.0), max pos weight 0.15/0.25, sector cap 5, Merton floor logic unified with live, bear dampening (0.6×) removed, PINN params updated to 0.155/0.178
 
-**Iter 7 (UNIVERSE_40 + momentum + sector cap 3/sector): REJECTED** — MaxDD still exceeded 15% in all periods (train −15.2%, val −18.0%, test −16.1%). Sector cap of 3 was insufficient; the combination of bear_recovery_mode + momentum + larger universe compounds drawdown risk beyond what PINN parameters are calibrated for. Universe expansion is off the table until a tighter drawdown control mechanism is found.
-
-**Final best config (Iter 4 + Iter 6):**
-- stop_loss=0.03, take_profit=0.0, trailing_stop=0.10, cash_reserve=0.10, max_positions=14, bear_recovery_mode=True
-- Sharpe (train/val/test): 0.21 / 0.49 / 0.33 — MaxDD: −13.1% / −13.5% / −7.9%
-
-**Live system delta vs best backtest config:** momentum ranking + RSI ceiling removal + sector cap are live-only features not validated in the fixed-universe backtest. They are sound in principle for the dynamic screener universe (which self-selects for quality/momentum) but have no backtest confirmation.
-
-**Do NOT re-investigate stop-loss widening or universe expansion until MaxDD < 15% in all periods is achievable.**
+**Hard constraints on future research:**
+- Do NOT re-investigate stop-loss widening or universe expansion until MaxDD < 15% in all periods.
+- Universe expansion (Iters 5, 7) rejected even with sector cap — off the table until tighter drawdown control exists.

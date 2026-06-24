@@ -11,7 +11,7 @@ Sizing hierarchy (institutional-grade):
   2. Regime γ-scale  — applied in engine.py before reaching here
   3. Vol targeting   — scale by (VOL_TARGET / realized_vol), clipped to [MIN, MAX]
   4. Inv-vol weights — 1/σ per stock distributes risk evenly across positions
-  5. Position caps   — max 10% equity, 10% cash reserve
+  5. Position caps   — 15% equity (bear/neutral) or 25% (bull, via max_pos_size param), 10% cash reserve
 """
 from __future__ import annotations
 from collections import deque

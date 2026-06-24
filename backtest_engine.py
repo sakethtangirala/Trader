@@ -58,10 +58,14 @@ RISK_FREE_RATE          = 0.05
 TRADING_HORIZON_T       = 0.5
 
 MAX_POSITIONS           = 14
-MAX_POS_WEIGHT          = 0.10
+MAX_POS_WEIGHT          = 0.15         # bear/neutral max position (live: MAX_POSITION_SIZE)
+BULL_MAX_POS_WEIGHT     = 0.25         # bull max position (live: BULL_MAX_POSITION_SIZE)
 MIN_POS_WEIGHT          = 0.015        # hysteresis buffer
 CASH_RESERVE_PCT        = 0.10
-SECTOR_MAX_POS          = 3
+SECTOR_MAX_POS          = 5            # live: SECTOR_MAX_POSITIONS
+
+BULL_BYPASS_PINN        = True         # match live settings.py
+BULL_LEVERAGE_FACTOR    = 1.5          # 150% notional in confirmed bull
 
 STOP_LOSS_PCT           = 0.03
 TRAILING_STOP_PCT       = 0.10
@@ -463,14 +467,15 @@ class PINNAllocator:
     The Heston PINN additionally incorporates VIX variance (y = (VIX/100)²).
     All outputs are clipped to [0, 1] and γ-scaled for regime.
 
-    Paper-calibrated parameters used in mock (Tables 1-4):
-        μ=0.128, σ=0.173 (GBM), κ=6.586, θ=0.038, σ_Y=0.643, ρ=−0.718 (Heston)
+    Live parameters matching train_pinns.py (updated 2026-06-21 for modern market dynamics):
+        μ=0.155, σ=0.178 (GBM), κ=6.586, θ=0.038, σ_Y=0.643, ρ=−0.718 (Heston)
     """
 
-    # Paper Table 1 / Table 2 calibrated values
-    _MU_GBM    = 0.128
-    _SIGMA_GBM = 0.173
-    _THETA     = 0.038   # Heston long-run variance
+    # Updated parameters matching train_pinns.py (2026-06-21 retraining)
+    # Original paper: μ=0.128, σ=0.173 — updated for modern market dynamics
+    _MU_GBM    = 0.155
+    _SIGMA_GBM = 0.178
+    _THETA     = 0.038   # Heston long-run variance (unchanged from paper calibration)
 
     def __init__(self, model_dir: str = "models") -> None:
         self._pinns: dict = {}
@@ -520,23 +525,24 @@ class PINNAllocator:
 
         merton = self._merton_mock(vix_var, gamma_eff)
 
-        if pinn_raw is not None and pinn_raw > 0.05:
-            # PINN output is plausible — use it
-            alloc = float(np.clip(pinn_raw, 0.0, 1.0))
-            logger.debug(f"PINN alloc={alloc:.4f} (raw={pinn_raw:.4f})")
+        # Mirror engine.py: max(PINN, VIX-attenuated Merton floor).
+        # The floor decays as VIX rises so the PINN's stochastic-vol awareness
+        # is not overridden during exactly the high-fear regimes it was designed
+        # to handle (VIX=15 → full floor; VIX=40+ → 25% floor).
+        vix_level   = (vix_c ** 0.5) * 100.0
+        floor_scale = float(np.clip(1.0 - 0.03 * (vix_level - 15.0), 0.25, 1.0))
+        merton_floor = merton * floor_scale
+
+        if pinn_raw is not None:
+            alloc = float(np.clip(max(pinn_raw, merton_floor), 0.0, 1.0))
+            logger.debug(f"PINN alloc={alloc:.4f} (raw={pinn_raw:.4f} merton_floor={merton_floor:.4f})")
         else:
-            # PINN output is near-zero or negative (calibration gap) → Merton fallback
             alloc = merton
-            if pinn_raw is not None:
-                logger.debug(f"PINN raw={pinn_raw:.4f} near-zero → Merton fallback {merton:.4f}")
 
         # Regime-aware γ scaling: mirrors engine.py compute_signals()
+        # Bull only — bear has no dampening in the live engine.
         if regime == "bull" and gamma_eff < CRRA_GAMMA:
             alloc = float(np.clip(alloc * (CRRA_GAMMA / gamma_eff), 0.0, 1.0))
-
-        # Bear dampening: lower effective μ in uncertain regime
-        if regime == "bear":
-            alloc *= 0.6
 
         return float(np.clip(alloc, 0.0, 1.0))
 
@@ -817,16 +823,23 @@ class RiskManager:
     def size_order(self, symbol: str, price: float,
                    pinn_alloc: float, vol_scale: float,
                    inv_vol_weight: float, all_inv_vol_sum: float,
-                   equity: float, cash: float) -> float:
+                   equity: float, cash: float,
+                   eff_equity: float | None = None,
+                   max_pos_size: float = MAX_POS_WEIGHT) -> float:
+        """
+        eff_equity: leveraged equity in confirmed bull (equity × 1.5); else equity.
+        max_pos_size: BULL_MAX_POS_WEIGHT (0.25) in bull, MAX_POS_WEIGHT (0.15) otherwise.
+        """
         if price <= 0 or inv_vol_weight <= 0 or all_inv_vol_sum <= 0:
             return 0.0
 
+        deploy_base      = eff_equity if eff_equity is not None else equity
         scaled_alloc     = float(np.clip(pinn_alloc * vol_scale, 0.0, 1.0))
-        total_deployable = equity * scaled_alloc
+        total_deployable = deploy_base * scaled_alloc
         weight           = inv_vol_weight / all_inv_vol_sum
         target_value     = total_deployable * weight
 
-        max_by_equity  = equity * MAX_POS_WEIGHT
+        max_by_equity  = equity * max_pos_size
         max_by_cash    = cash   * (1.0 - CASH_RESERVE_PCT)
         position_value = min(target_value, max_by_equity, max_by_cash)
 
@@ -865,8 +878,9 @@ class BacktestEngine:
         self._risk     = RiskManager()
         self._port     = Portfolio(INITIAL_CAPITAL)
 
-        self._daily_start_equity = INITIAL_CAPITAL
-        self._circuit_open       = False
+        self._daily_start_equity  = INITIAL_CAPITAL
+        self._circuit_open        = False
+        self._pending_orders: list[PendingOrder] = []
 
     # ── Intraday helpers ─────────────────────────────────────────────────────
 
@@ -985,11 +999,22 @@ class BacktestEngine:
         # Exit scan for existing positions
         self._run_exit_scan(day, minute)
 
-        # γ-aware PINN allocation
-        gamma_eff = CRRA_GAMMA_BULL if regime == "bull" else CRRA_GAMMA
-        t_hor     = self._time_to_horizon(day)
-        w_norm    = max(equity / INITIAL_CAPITAL, 0.1)
-        pinn_alloc = self._pinn.query(regime, t_hor, w_norm, vix_var, gamma_eff)
+        # γ-aware PINN allocation — mirrors main.py confirmed_bull logic exactly
+        vix_val        = self._data.vix(day)
+        confirmed_bull = (regime == "bull" and vix_val < VIX_HIGH_THRESHOLD)
+        gamma_eff      = CRRA_GAMMA_BULL if regime == "bull" else CRRA_GAMMA
+        t_hor          = self._time_to_horizon(day)
+        w_norm         = max(equity / INITIAL_CAPITAL, 0.1)
+
+        if confirmed_bull and BULL_BYPASS_PINN:
+            # Full bull deployment: PINN ceiling bypassed, 1.5× notional leverage
+            pinn_alloc  = 1.0
+            eff_equity  = equity * BULL_LEVERAGE_FACTOR
+            max_pos_wt  = BULL_MAX_POS_WEIGHT
+        else:
+            pinn_alloc  = self._pinn.query(regime, t_hor, w_norm, vix_var, gamma_eff)
+            eff_equity  = equity
+            max_pos_wt  = MAX_POS_WEIGHT
 
         # Skip buys if max positions reached
         n_open = len(self._port.positions)
@@ -1019,13 +1044,13 @@ class BacktestEngine:
         candidates = self._risk.sector_cap_filter(candidates)
 
         # Fill open slots
-        slots   = MAX_POSITIONS - n_open
-        to_buy  = candidates[:slots]
+        slots  = MAX_POSITIONS - n_open
+        to_buy = candidates[:slots]
         if not to_buy:
             return regime
 
-        vol_sc       = self._port.vol_scale()
-        inv_vol_sum  = sum(1.0 / c["sigma"] for c in to_buy)
+        vol_sc      = self._port.vol_scale()
+        inv_vol_sum = sum(1.0 / c["sigma"] for c in to_buy)
         if inv_vol_sum <= 0:
             return regime
 
@@ -1039,18 +1064,18 @@ class BacktestEngine:
             qty = self._risk.size_order(
                 c["symbol"], price, pinn_alloc, vol_sc,
                 inv_vol_w, inv_vol_sum, equity, self._port.cash,
+                eff_equity=eff_equity, max_pos_size=max_pos_wt,
             )
             if qty <= 0:
                 continue
             limit_px = round(price * (1 - LIMIT_OFFSET_BPS / 10_000), 4)
             submitted_dt = datetime.combine(day, MARKET_OPEN) + timedelta(minutes=minute)
             order = PendingOrder(c["symbol"], qty, limit_px, submitted_dt)
-            # Attempt fill immediately (sweeps within this cycle's minute window)
             fill = self._fill.try_fill_order(order, day, minute)
             self._port.apply_fill(fill)
             logger.debug(
                 f"  BUY {c['symbol']} qty={fill.qty:.3f} @ {fill.price:.2f} "
-                f"[{fill.fill_type}] mom={c['mom']:+.2f}"
+                f"[{fill.fill_type}] mom={c['mom']:+.2f} bull={confirmed_bull}"
             )
 
         return regime

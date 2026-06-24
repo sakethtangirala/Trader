@@ -9,10 +9,18 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = True
 
 # --- Universe (dynamic, rebuilt daily) ---
-UNIVERSE_SIZE = 150             # max symbols in the trading universe
+UNIVERSE_SIZE = 150             # max symbols for screener/Alpaca fallback paths only; CSV primary returns full ~1,900
 UNIVERSE_MIN_PRICE = 5.0        # exclude penny stocks
 UNIVERSE_MIN_AVG_VOLUME = 1_000_000  # minimum 1M avg daily shares
 SIGNAL_LOOKBACK_DAYS = 260      # OHLCV lookback: extended to support 12-1 momentum score
+
+# Primary universe source: local CSV, validated against Alpaca tradable assets.
+# Set CSV_UNIVERSE_MAX_SYMBOLS = 0 to allow the full validated CSV universe.
+CSV_UNIVERSE_ENABLED: bool = True
+CSV_UNIVERSE_PATH: str = "stock_info.csv"
+CSV_UNIVERSE_TICKER_COLUMN: str = "Ticker"
+CSV_UNIVERSE_MAX_SYMBOLS: int = 0
+CSV_UNIVERSE_REQUIRE_FRACTIONABLE: bool = True
 
 # Emergency fallback if all universe sources fail
 FALLBACK_WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AMD", "SPY", "QQQ"]
